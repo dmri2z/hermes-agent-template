@@ -32,11 +32,103 @@ ENV HERMES_REF=${HERMES_REF}
 # Keep setup_22.x. v2026.8.3's new .npmrc sets engine-strict=true, so hermes'
 # `node >=22.22.0` + `npm <11.10.0 || >=11.17.0` is now a hard EBADENGINE build
 # failure, not a warning — setup_24.x bundles an npm that satisfies neither.
+# procps (ps / pgrep / pkill) is installed EXPLICITLY, not inherited. hermes
+# shells out to it for gateway PID ownership (hermes_cli/gateway.py: `ps -o
+# ppid= -p`, `ps -Aww -o pid=,command=`), the dashboard's process view
+# (dashboard_procs.py) and gitlock.py's `pgrep -x git`. Only the first guards
+# with shutil.which(); the rest assume it exists. The base image tag is a
+# moving target and a 2026-09 rebuild of it stopped shipping procps, which
+# silently degraded those paths — pin the dependency here rather than trust
+# whatever the upstream tag happens to contain.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini && \
+    apt-get install -y --no-install-recommends curl ca-certificates git tini procps && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
+
+# ── SQLite: replace the distro's 3.40.1 ───────────────────────────────────
+# Debian bookworm ships SQLite 3.40.1, which fails hermes on two counts.
+# NEITHER is fixable by redeploying — the version is pinned by the base
+# image's distro, so it has to be overridden here.
+#
+#  1. The WAL-reset corruption bug (https://sqlite.org/wal.html#walresetbug).
+#     `hermes doctor` flags every WAL database under $HERMES_HOME for this and
+#     names 3.51.3+ / 3.50.7 / 3.44.6 as the fixed releases: a vulnerable
+#     fresh-opener can unlink a live WAL/SHM out from under a running gateway.
+#     hermes' own salvage lane (session_lost_and_found.py) refuses to run on a
+#     vulnerable build for the same reason.
+#
+#  2. hermes' FTS write-health probe (_db_opens_cleanly in
+#     hermes_state_repair.py) ends with `INSERT INTO <fts>(<fts>)
+#     VALUES('flush')`. fts5 gained `flush` after 3.40.1, so on bookworm it
+#     raises "SQL logic error" — identical to what a nonsense command returns,
+#     verified against a brand-new empty fts5 table. `hermes doctor` therefore
+#     reports "state.db FTS write corruption" against a perfectly healthy
+#     database, `hermes sessions repair` reports success, and the next probe
+#     fails again. Forever. Each round costs a gateway outage, and doctor's
+#     advice ("restore from the backup copy beside state.db") names a file the
+#     repair path never created — it aborts on its live-writer preflight,
+#     before the backup step, whenever the gateway is up.
+#
+# CPython's _sqlite3 links libsqlite3.so.0 dynamically and /usr/local/lib
+# precedes /lib/<triplet> in ld.so.conf, so installing a newer build there and
+# running ldconfig overrides Debian's without rebuilding CPython.
+#
+# --soname=legacy is LOAD-BEARING: since the 3.48 switch to autosetup, the
+# default is NO soname, which installs a bare libsqlite3.so that nothing
+# linked against libsqlite3.so.0 will ever load. "legacy" restores
+# libsqlite3.so.0, which ldconfig then symlinks. --all matches Debian's
+# fts4 + fts5 + rtree; the CFLAGS cover the other build options Debian enables
+# that callers may expect.
+#
+# Build deps are purged inside the same layer so the toolchain never lands in
+# the image. The apt-mark dance around that purge is defensive, not cosmetic:
+# a bare `--auto-remove` sweeps every auto-installed package nothing manual
+# depends on, which can reap packages the base image shipped and hermes still
+# needs, not just build-essential's own dependencies. Pinning the pre-existing
+# auto set to manual for the duration confines the purge; the marks are
+# restored afterwards so a later `apt autoremove` still behaves normally.
+#
+# To bump: take the tarball and its SHA3-256/SHA-256 from
+# https://sqlite.org/download.html and keep it at or above 3.51.3.
+ARG SQLITE_YEAR=2026
+ARG SQLITE_VERSION=3530400
+ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
+RUN apt-get update && \
+    apt-mark showauto > /tmp/apt-auto-before.txt && \
+    xargs -r -a /tmp/apt-auto-before.txt apt-mark manual > /dev/null && \
+    apt-get install -y --no-install-recommends build-essential && \
+    curl -fsSL -o /tmp/sqlite.tar.gz \
+      "https://sqlite.org/${SQLITE_YEAR}/sqlite-autoconf-${SQLITE_VERSION}.tar.gz" && \
+    echo "${SQLITE_SHA256}  /tmp/sqlite.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/sqlite.tar.gz -C /tmp && \
+    cd "/tmp/sqlite-autoconf-${SQLITE_VERSION}" && \
+    CFLAGS="-O2 -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_DBSTAT_VTAB -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_SECURE_DELETE" \
+      ./configure --prefix=/usr/local --disable-static --all --soname=legacy && \
+    make -j"$(nproc)" && \
+    make install && \
+    ldconfig && \
+    cd / && \
+    rm -rf /tmp/sqlite.tar.gz "/tmp/sqlite-autoconf-${SQLITE_VERSION}" && \
+    apt-get purge -y --auto-remove build-essential && \
+    xargs -r -a /tmp/apt-auto-before.txt apt-mark auto > /dev/null && \
+    rm -f /tmp/apt-auto-before.txt && \
+    rm -rf /var/lib/apt/lists/*
+
+# Fail the BUILD rather than a 3am gateway restart if the override above
+# silently did not take — a changed ld path, a distro layout change, or a base
+# image that statically links SQLite into CPython would all leave the old
+# version in place with no other signal. Asserts exactly the two things that
+# were broken: a WAL-safe version, and the fts5 command the health probe runs.
+RUN python3 -c "import sqlite3; \
+assert sqlite3.sqlite_version_info >= (3, 51, 3), \
+    'libsqlite3 override did not take: ' + sqlite3.sqlite_version; \
+c = sqlite3.connect(':memory:'); \
+c.execute('CREATE VIRTUAL TABLE t USING fts5(body)'); \
+c.execute(\"INSERT INTO t(body) VALUES('probe')\"); \
+c.execute(\"INSERT INTO t(t) VALUES('flush')\"); \
+c.execute(\"INSERT INTO t(t) VALUES('integrity-check')\"); \
+print('sqlite', sqlite3.sqlite_version, '- fts5 flush + integrity-check OK')"
 
 # Install hermes-agent (provides the `hermes` CLI) and pre-build its React
 # dashboard so `hermes dashboard` has nothing to build at runtime.
