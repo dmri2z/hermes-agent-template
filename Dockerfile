@@ -32,8 +32,16 @@ ENV HERMES_REF=${HERMES_REF}
 # Keep setup_22.x. v2026.8.3's new .npmrc sets engine-strict=true, so hermes'
 # `node >=22.22.0` + `npm <11.10.0 || >=11.17.0` is now a hard EBADENGINE build
 # failure, not a warning — setup_24.x bundles an npm that satisfies neither.
+# procps (ps / pgrep / pkill) is installed EXPLICITLY, not inherited. hermes
+# shells out to it for gateway PID ownership (hermes_cli/gateway.py: `ps -o
+# ppid= -p`, `ps -Aww -o pid=,command=`), the dashboard's process view
+# (dashboard_procs.py) and gitlock.py's `pgrep -x git`. Only the first guards
+# with shutil.which(); the rest assume it exists. The base image tag is a
+# moving target and a 2026-09 rebuild of it stopped shipping procps, which
+# silently degraded those paths — pin the dependency here rather than trust
+# whatever the upstream tag happens to contain.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini && \
+    apt-get install -y --no-install-recommends curl ca-certificates git tini procps && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
@@ -74,13 +82,12 @@ RUN apt-get update && \
 # that callers may expect.
 #
 # Build deps are purged inside the same layer so the toolchain never lands in
-# the image. The apt-mark dance around that purge is NOT optional:
-# `--auto-remove` sweeps every auto-installed package nothing manual depends
-# on, which reaps packages the base image shipped and hermes still needs —
-# procps (ps / pgrep / pkill / top / free) went first, observed on a real
-# build. Pinning the pre-existing auto set to manual for the duration confines
-# the purge to build-essential's own dependencies; the marks are restored
-# afterwards so a later `apt autoremove` still behaves normally.
+# the image. The apt-mark dance around that purge is defensive, not cosmetic:
+# a bare `--auto-remove` sweeps every auto-installed package nothing manual
+# depends on, which can reap packages the base image shipped and hermes still
+# needs, not just build-essential's own dependencies. Pinning the pre-existing
+# auto set to manual for the duration confines the purge; the marks are
+# restored afterwards so a later `apt autoremove` still behaves normally.
 #
 # To bump: take the tarball and its SHA3-256/SHA-256 from
 # https://sqlite.org/download.html and keep it at or above 3.51.3.
