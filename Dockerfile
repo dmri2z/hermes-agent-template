@@ -40,8 +40,17 @@ ENV HERMES_REF=${HERMES_REF}
 # moving target and a 2026-09 rebuild of it stopped shipping procps, which
 # silently degraded those paths — pin the dependency here rather than trust
 # whatever the upstream tag happens to contain.
+#
+# ripgrep is pinned for the same reason. The slim base does not ship it, and
+# hermes degrades silently rather than failing: it logs "ripgrep (rg) not found
+# (file search uses grep fallback)" at startup and every file-search tool call
+# then takes the slower grep path. Nothing else surfaces this — so the fix has
+# to live in the image. An `apt-get install` over `railway ssh` does not
+# survive: /usr is baked into the layer while only /data is on the volume, and
+# this service sleeps when inactive, so the container is rebuilt from the image
+# on the next wake.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini procps && \
+    apt-get install -y --no-install-recommends curl ca-certificates git tini procps ripgrep && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
