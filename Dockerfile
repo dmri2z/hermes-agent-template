@@ -74,12 +74,22 @@ RUN apt-get update && \
 # that callers may expect.
 #
 # Build deps are purged inside the same layer so the toolchain never lands in
-# the image. To bump: take the tarball and its SHA3-256/SHA-256 from
+# the image. The apt-mark dance around that purge is NOT optional:
+# `--auto-remove` sweeps every auto-installed package nothing manual depends
+# on, which reaps packages the base image shipped and hermes still needs —
+# procps (ps / pgrep / pkill / top / free) went first, observed on a real
+# build. Pinning the pre-existing auto set to manual for the duration confines
+# the purge to build-essential's own dependencies; the marks are restored
+# afterwards so a later `apt autoremove` still behaves normally.
+#
+# To bump: take the tarball and its SHA3-256/SHA-256 from
 # https://sqlite.org/download.html and keep it at or above 3.51.3.
 ARG SQLITE_YEAR=2026
 ARG SQLITE_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
 RUN apt-get update && \
+    apt-mark showauto > /tmp/apt-auto-before.txt && \
+    xargs -r -a /tmp/apt-auto-before.txt apt-mark manual > /dev/null && \
     apt-get install -y --no-install-recommends build-essential && \
     curl -fsSL -o /tmp/sqlite.tar.gz \
       "https://sqlite.org/${SQLITE_YEAR}/sqlite-autoconf-${SQLITE_VERSION}.tar.gz" && \
@@ -94,6 +104,8 @@ RUN apt-get update && \
     cd / && \
     rm -rf /tmp/sqlite.tar.gz "/tmp/sqlite-autoconf-${SQLITE_VERSION}" && \
     apt-get purge -y --auto-remove build-essential && \
+    xargs -r -a /tmp/apt-auto-before.txt apt-mark auto > /dev/null && \
+    rm -f /tmp/apt-auto-before.txt && \
     rm -rf /var/lib/apt/lists/*
 
 # Fail the BUILD rather than a 3am gateway restart if the override above
